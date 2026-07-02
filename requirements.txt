@@ -1,5 +1,6 @@
 pandas
 matplotlib
+PyQt5
 statsmodels
 scikit-learn
 prophet
