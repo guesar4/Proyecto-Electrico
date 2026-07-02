@@ -6,7 +6,8 @@ Este proyecto implementa un **agente de inteligencia artificial basado en modelo
 - Analizar series de tiempo de consumo eléctrico nacional  
 - Generar gráficos y estadísticas  
 - Ejecutar código Python bajo demanda  
-- Realizar predicciones (1–3 días) usando regresores especializados (Prophet y ARIMA)  
+- Realizar predicciones a varios días usando Prophet, ARIMA o KNN (`KNeighborsRegressor`)  
+- Comparar el desempeño de Prophet, ARIMA y KNN contra datos reales retenidos (holdout), con métricas de error (MAE, RMSE, MAPE) y un gráfico interactivo de Plotly  
 - Funcionar completamente en local, sin GPU, sin API keys y sin conexión a la nube  
 
 El sistema se desarrolló siguiendo el enfoque de agentes descrito por **Mauro Di Pietro** y aplicando el enunciado del **Proyecto Eléctrico II-2025** del profesor Marvin Coto.  
@@ -26,9 +27,12 @@ El agente combina un modelo de lenguaje local (por ejemplo, `qwen2.5:7b`) con un
 
 | Herramienta | Función |
 |------------|---------|
+| **`load_csv`** | Carga un archivo CSV de series de tiempo y detecta su columna de fechas |
 | **`code_exec`** | Ejecuta código Python sobre el dataframe cargado |
 | **`plot_data`** | Genera gráficos (tendencias, días específicos, comparaciones) |
 | **`predict_data`** | Produce predicciones usando Prophet o ARIMA |
+| **`predict_knn`** | Produce predicciones usando KNN (`KNeighborsRegressor`) con features de rezago |
+| **`compare_models`** | Compara Prophet, ARIMA y KNN contra datos reales retenidos (holdout) y muestra métricas (MAE, RMSE, MAPE) en un gráfico interactivo de Plotly |
 | **`final_answer`** | Devuelve respuestas explicativas en lenguaje natural |
 
 **Flujo de trabajo del agente**  
@@ -75,7 +79,7 @@ Proyecto-Electrico/
 
 - **Python 3.11+**
 - **Ollama** instalado   https://ollama.com/download
-- Paquetes listados en `requirements.txt`
+- Paquetes listados en `requirements.txt` (incluye `PyQt5`, necesario para que los gráficos de matplotlib se muestren en una ventana interactiva)
 
 
 
