@@ -7,6 +7,7 @@ import pandas as pd
 import matplotlib
 matplotlib.use("QtAgg")  # backend interactivo para mostrar ventanas de gráficos
 import matplotlib.pyplot as plt
+import plotly.graph_objects as go
 
 #Validación/limpiar, parsear JSON y salida
 import ast
@@ -19,6 +20,7 @@ import json
 from statsmodels.tsa.arima.model import ARIMA
 from prophet import Prophet
 from sklearn.neighbors import KNeighborsRegressor
+from sklearn.metrics import mean_absolute_error, mean_squared_error
 import numpy as np
 
 
@@ -328,6 +330,25 @@ def normalize_csv_args(t_inputs):
 # =============================
 
 
+def horizon_to_periods(index, horizon_days):
+    """
+    Convierte un horizonte en días al número de pasos (filas) y a la frecuencia
+    real de los datos, para que "horizon" siempre signifique días de calendario
+    sin importar la granularidad del dataset cargado (15min, horaria, diaria, etc.).
+    Devuelve (periods, freq).
+    """
+    freq = pd.infer_freq(index) or "D"
+    try:
+        delta = pd.Timedelta(pd.tseries.frequencies.to_offset(freq))
+        if delta <= pd.Timedelta(0):
+            return horizon_days, freq
+        periods = max(int(round(pd.Timedelta(days=horizon_days) / delta)), 1)
+        return periods, freq
+    except Exception:
+        # Frecuencias no fijas (ej. "M", "MS") no se pueden convertir a Timedelta
+        return horizon_days, freq
+
+
 def predict_data(model="prophet", column=None, horizon=7):
     """
     Genera predicciones de series de tiempo usando Prophet o ARIMA y grafica los valores futuros.
@@ -343,10 +364,12 @@ def predict_data(model="prophet", column=None, horizon=7):
         df = df[[column]].dropna().reset_index()
         df.columns = ["ds", "y"]  # Prophet requiere estos nombres
 
+        periods, freq = horizon_to_periods(pd.DatetimeIndex(df["ds"]), horizon)
+
         if model.lower() == "prophet":
             m = Prophet(daily_seasonality=True)
             m.fit(df)
-            future = m.make_future_dataframe(periods=horizon)
+            future = m.make_future_dataframe(periods=periods, freq=freq)
             forecast = m.predict(future)
 
             # Graficar
@@ -359,18 +382,23 @@ def predict_data(model="prophet", column=None, horizon=7):
             plt.show()
 
             # Devolver últimos valores predichos
-            tail = forecast[["ds", "yhat"]].tail(horizon)
+            tail = forecast[["ds", "yhat"]].tail(periods)
             return f"Predicción con Prophet completada. Últimos valores:\n{tail.to_string(index=False)}"
 
         elif model.lower() == "arima":
             df.set_index("ds", inplace=True)
+            try:
+                df.index.freq = pd.tseries.frequencies.to_offset(freq)  # evita warning de frecuencia no informada
+            except ValueError:
+                pass  # índice no perfectamente regular; se deja que ARIMA infiera igual
             model_fit = ARIMA(df["y"], order=(2, 1, 2)).fit()
-            forecast = model_fit.forecast(steps=horizon)
+            forecast = model_fit.forecast(steps=periods)
+            future_dates = pd.date_range(df.index[-1], periods=periods + 1, freq=freq)[1:]
 
             # Graficar
             plt.figure(figsize=(10, 5))
             plt.plot(df.index, df["y"], label="Datos reales")
-            plt.plot(pd.date_range(df.index[-1], periods=horizon+1, freq="D")[1:], forecast,  label="Predicción", linestyle="--")
+            plt.plot(future_dates, forecast, label="Predicción", linestyle="--")
             plt.title(f"Predicción con ARIMA para {column} ({horizon} días)")
             plt.xlabel("Fecha")
             plt.ylabel(column)
@@ -381,8 +409,8 @@ def predict_data(model="prophet", column=None, horizon=7):
 
             # Devolver últimos valores predichos
             forecast_df = pd.DataFrame({
-                "ds": pd.date_range(df.index[-1], periods=horizon+1, freq="D")[1:],
-                "yhat": forecast
+                "ds": future_dates,
+                "yhat": forecast.values
             })
             return f"Predicción con ARIMA completada. Últimos valores:\n{forecast_df.to_string(index=False)}"
 
@@ -442,6 +470,8 @@ def predict_knn(column=None, horizon=7, n_neighbors=5, n_lags=7):
         if len(serie) <= n_lags:
             return f"Error: no hay suficientes datos ({len(serie)}) para usar {n_lags} rezagos."
 
+        periods, freq = horizon_to_periods(serie.index, horizon)
+
         values = serie.values
 
         # Construir matriz de features (lags) y target
@@ -457,13 +487,13 @@ def predict_knn(column=None, horizon=7, n_neighbors=5, n_lags=7):
         # Predicción recursiva: usa las predicciones previas para predecir el siguiente paso
         last_window = list(values[-n_lags:])
         preds = []
-        for _ in range(horizon):
+        for _ in range(periods):
             x_input = np.array(last_window[-n_lags:]).reshape(1, -1)
             next_val = model.predict(x_input)[0]
             preds.append(next_val)
             last_window.append(next_val)
 
-        future_dates = pd.date_range(serie.index[-1], periods=horizon + 1, freq="D")[1:]
+        future_dates = pd.date_range(serie.index[-1], periods=periods + 1, freq=freq)[1:]
         forecast_df = pd.DataFrame({"ds": future_dates, "yhat": preds})
 
         # Graficar
@@ -515,6 +545,174 @@ tool_predict_knn = {
 
 
 # =============================
+# Herramienta para comparar modelos (dashboard de predicciones)
+# =============================
+
+
+def compare_models(column=None, horizon=7, models=None, n_neighbors=5, n_lags=7):
+    """
+    Compara predicciones de prophet, arima y/o knn contra datos reales retenidos (holdout)
+    y muestra un gráfico interactivo de Plotly con las métricas de error (MAE, RMSE, MAPE).
+    - column: nombre de la columna a predecir y comparar
+    - horizon: días retenidos como datos reales de prueba (holdout) y horizonte de predicción
+    - models: subconjunto de ["prophet","arima","knn"]. Si es None, se comparan los tres.
+    - n_neighbors, n_lags: hiperparámetros de KNN (mismos defaults que predict_knn)
+    """
+    try:
+        if not models:
+            models = ["prophet", "arima", "knn"]
+
+        df = dtf.copy()
+        if column is None or column not in df.columns:
+            return f"Error: debes especificar una columna válida. Columnas disponibles: {list(df.columns)}"
+
+        serie = df[column].dropna()
+        periods, freq = horizon_to_periods(serie.index, horizon)
+        if len(serie) <= periods:
+            return f"Error: la serie tiene {len(serie)} filas, insuficientes para un holdout de {horizon} días ({periods} pasos)."
+
+        train = serie.iloc[:-periods]
+        test = serie.iloc[-periods:]
+        test_dates = test.index
+
+        results = {}
+        errors = []
+
+        if "prophet" in models:
+            try:
+                train_df = train.reset_index()
+                train_df.columns = ["ds", "y"]
+                m = Prophet(daily_seasonality=True)
+                m.fit(train_df)
+                future = m.make_future_dataframe(periods=periods, freq=freq)
+                fcst = m.predict(future)
+                yhat = fcst[["ds", "yhat"]].tail(periods)["yhat"]
+                yhat.index = test_dates
+                results["prophet"] = yhat
+            except Exception as e:
+                errors.append(f"prophet: {e}")
+
+        if "arima" in models:
+            try:
+                train_arima = train.copy()
+                try:
+                    train_arima.index.freq = pd.tseries.frequencies.to_offset(freq)
+                except ValueError:
+                    pass  # índice no perfectamente regular; se deja que ARIMA infiera igual
+                fit = ARIMA(train_arima, order=(2, 1, 2)).fit()
+                fcst = fit.forecast(steps=periods)
+                fcst.index = test_dates
+                results["arima"] = fcst
+            except Exception as e:
+                errors.append(f"arima: {e}")
+
+        if "knn" in models:
+            if len(train) <= n_lags:
+                errors.append(f"knn: no hay suficientes datos de entrenamiento ({len(train)}) para {n_lags} rezagos.")
+            else:
+                try:
+                    values = train.values
+                    X, y = [], []
+                    for i in range(n_lags, len(values)):
+                        X.append(values[i - n_lags:i])
+                        y.append(values[i])
+                    X, y = np.array(X), np.array(y)
+
+                    knn_model = KNeighborsRegressor(n_neighbors=n_neighbors)
+                    knn_model.fit(X, y)
+
+                    last_window = list(values[-n_lags:])
+                    preds = []
+                    for _ in range(periods):
+                        x_input = np.array(last_window[-n_lags:]).reshape(1, -1)
+                        next_val = knn_model.predict(x_input)[0]
+                        preds.append(next_val)
+                        last_window.append(next_val)
+
+                    results["knn"] = pd.Series(preds, index=test_dates)
+                except Exception as e:
+                    errors.append(f"knn: {e}")
+
+        if not results:
+            return f"Error: ningún modelo pudo entrenarse/predecir. Detalles: {errors}"
+
+        # Calcular métricas de error por modelo
+        metric_rows = []
+        real = test.values
+        for name, yhat in results.items():
+            pred = yhat.values
+            mae = mean_absolute_error(real, pred)
+            rmse = np.sqrt(mean_squared_error(real, pred))
+            mape = np.mean(np.abs((real - pred) / real)) * 100
+            metric_rows.append({"Modelo": name, "MAE": round(mae, 3), "RMSE": round(rmse, 3), "MAPE (%)": round(mape, 2)})
+        metrics_df = pd.DataFrame(metric_rows)
+
+        # Graficar con Plotly
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=serie.index, y=serie.values, mode="lines",
+                                  name="Real (histórico)", line=dict(color="#2a78d6", width=2)))
+
+        color_map = {"prophet": "#1baf7a", "arima": "#eda100", "knn": "#4a3aa7"}
+        for name in ["prophet", "arima", "knn"]:
+            if name in results:
+                fig.add_trace(go.Scatter(x=test_dates, y=results[name].values, mode="lines+markers",
+                                          name=f"Predicción {name}",
+                                          line=dict(color=color_map[name], width=2, dash="dash")))
+
+        fig.add_vline(x=train.index[-1], line_width=1, line_dash="dot", line_color="gray",
+                      annotation_text="Inicio holdout", annotation_position="top")
+        fig.update_layout(title=f"Comparación de modelos para {column} (holdout={horizon} días)",
+                          xaxis_title="Fecha", yaxis_title=column, legend_title="Serie",
+                          template="plotly_white")
+        fig.show()
+
+        summary = f"Comparación completada para '{column}' (horizon={horizon}).\n"
+        summary += metrics_df.to_string(index=False)
+        if errors:
+            summary += "\n\nModelos no evaluados:\n" + "\n".join(errors)
+        return summary
+
+    except Exception as e:
+        return f"Error durante la comparación de modelos: {e}"
+
+
+tool_compare_models = {
+  'type': 'function',
+  'function': {
+    'name': 'compare_models',
+    'description': 'Compara predicciones de varios modelos (prophet, arima, knn) contra datos reales retenidos (holdout) y muestra un gráfico interactivo de Plotly con las métricas de error (MAE, RMSE, MAPE) de cada modelo. Usa esta herramienta cuando el usuario pida comparar modelos o evaluar qué tan buena es una predicción.',
+    'parameters': {
+      'type': 'object',
+      'properties': {
+        'column': {
+          'type': 'string',
+          'description': 'Nombre de la columna a predecir y comparar'
+        },
+        'horizon': {
+          'type': 'integer',
+          'description': 'Días retenidos como datos reales de prueba (holdout) y horizonte de predicción.'
+        },
+        'models': {
+          'type': 'array',
+          'items': {'type': 'string'},
+          'description': 'Lista de modelos a comparar: subconjunto de ["prophet","arima","knn"]. Si no se especifica, se comparan los tres.'
+        },
+        'n_neighbors': {
+          'type': 'integer',
+          'description': 'Número de vecinos a usar en KNN (por defecto 5), solo aplica si "knn" está en models.'
+        },
+        'n_lags': {
+          'type': 'integer',
+          'description': 'Número de rezagos usados como features en KNN (por defecto 7), solo aplica si "knn" está en models.'
+        }
+      },
+      'required': ['column']
+    }
+  }
+}
+
+
+# =============================
 # Diccionario de herramientas
 # El LLM solo ve las herramientas en este diccionario
 # =============================
@@ -524,7 +722,8 @@ dic_tools = {
     "code_exec": code_exec,
     "plot_data": plot_data,
     "predict_data": predict_data,
-    "predict_knn": predict_knn
+    "predict_knn": predict_knn,
+    "compare_models": compare_models
 
 }
 
@@ -578,6 +777,32 @@ def use_tool(agent_res: dict, dic_tools: dict) -> dict:
                     t_inputs.setdefault("n_lags", 7)
                     if "column" not in t_inputs or t_inputs["column"] not in dtf.columns:
                         t_inputs["column"] = list(dtf.columns)[0]
+
+            elif t_name == "compare_models":
+                if isinstance(t_inputs, dict):
+                    # Valores por defecto
+                    t_inputs.setdefault("horizon", 7)
+                    t_inputs.setdefault("n_neighbors", 5)
+                    t_inputs.setdefault("n_lags", 7)
+                    if "column" not in t_inputs or t_inputs["column"] not in dtf.columns:
+                        t_inputs["column"] = list(dtf.columns)[0]
+
+                    # Normalizar "models" (puede llegar como string, lista o None)
+                    if "models" in t_inputs:
+                        if isinstance(t_inputs["models"], str):
+                            try:
+                                t_inputs["models"] = json.loads(t_inputs["models"].replace("'", '"'))
+                            except Exception:
+                                t_inputs["models"] = [t_inputs["models"]]
+                        elif t_inputs["models"] is None:
+                            t_inputs.pop("models")
+
+                    if "models" in t_inputs and isinstance(t_inputs["models"], list):
+                        validos = [m for m in t_inputs["models"] if m in ("prophet", "arima", "knn")]
+                        if validos:
+                            t_inputs["models"] = validos
+                        else:
+                            t_inputs.pop("models")
 
             elif t_name == "final_answer" and isinstance(t_inputs, dict) and "final_answer" in t_inputs:
                 t_inputs = {"text": t_inputs["final_answer"]}
@@ -710,6 +935,14 @@ Reglas para predicciones:
 - Nunca inventes valores de predicción; deben provenir de la ejecución real.
 - Después de predecir, usa final_answer para explicar el resultado.
 
+Reglas para comparación de modelos:
+- Usa la herramienta compare_models cuando el usuario pida comparar modelos, evaluar qué tan buena es una predicción, o pida métricas de error (MAE, RMSE, MAPE) de una predicción.
+- compare_models NO predice hacia el futuro: retiene los últimos "horizon" días como datos reales de prueba, entrena cada modelo con el resto, y compara la predicción contra esos datos reales retenidos.
+- Parámetros: {"column": "MW", "horizon": 7, "models": ["prophet","arima","knn"]}.
+- Si el usuario no especifica modelos, compara los tres (prophet, arima, knn).
+- Siempre muestra el gráfico interactivo (Plotly) y el resumen de métricas devuelto por la herramienta.
+- Después de comparar, usa final_answer para explicar cuál modelo tuvo mejor desempeño según las métricas.
+
 Reglas para final_answer:
 - Usa final_answer solo para texto descriptivo o interpretaciones.
 - No inventes valores calculados; todos deben provenir de code_exec, plot_data o predict_data.
@@ -727,6 +960,8 @@ Ejemplos:
 - Usuario: "¿Qué tan correlacionadas están MW y MW_P?" → {"name":"code_exec","arguments":{"code":"print(dtf[\"MW\"].corr(dtf[\"MW_P\"]))"}} 
 - Usuario: "Haz una predicción de los próximos 7 días con Prophet para MW" → {"name":"predict_data","arguments":{"model":"prophet","column":"MW","horizon":7}}
 - Usuario: "Predice MW con KNN para los próximos 5 días" → {"name":"predict_knn","arguments":{"column":"MW","horizon":5}}
+- Usuario: "Compara los modelos Prophet, ARIMA y KNN para MW en los próximos 7 días" → {"name":"compare_models","arguments":{"column":"MW","horizon":7,"models":["prophet","arima","knn"]}}
+- Usuario: "¿Qué tan buena es la predicción de Prophet para MW?" → {"name":"compare_models","arguments":{"column":"MW","horizon":7,"models":["prophet"]}}
 '''
 
 
@@ -748,7 +983,8 @@ while True:
         "code_exec": tool_code_exec,
         "plot_data": tool_plot_data,
         "predict_data": tool_predict_data,
-        "predict_knn": tool_predict_knn
+        "predict_knn": tool_predict_knn,
+        "compare_models": tool_compare_models
     }
     res = run_agent(llm, messages, available_tools)
     print("👽 >", res)
