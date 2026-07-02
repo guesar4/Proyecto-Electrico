@@ -18,6 +18,7 @@ import json
 
 # Predicciones de series de tiempo
 from statsmodels.tsa.arima.model import ARIMA
+from statsmodels.tsa.statespace.sarimax import SARIMAX
 from prophet import Prophet
 from sklearn.neighbors import KNeighborsRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error
@@ -349,6 +350,44 @@ def horizon_to_periods(index, horizon_days):
         return horizon_days, freq
 
 
+def seasonal_period_for_freq(freq):
+    """
+    Estima un periodo estacional razonable ("m") para SARIMA según la frecuencia
+    de los datos: ciclo diario para datos intradía (ej. 96 pasos para 15min),
+    ciclo semanal para datos diarios. Devuelve 0 si no aplica estacionalidad simple.
+    """
+    try:
+        delta = pd.Timedelta(pd.tseries.frequencies.to_offset(freq))
+    except Exception:
+        return 0
+    if delta <= pd.Timedelta(0):
+        return 0
+    day = pd.Timedelta(days=1)
+    if delta < day:
+        m = int(round(day / delta))
+        return m if m > 1 else 0
+    if delta == day:
+        return 7  # ciclo semanal para datos diarios
+    return 0  # frecuencias mayores (semanal, mensual, ...): sin estacionalidad simple
+
+
+def fit_sarima_forecast(serie, freq, periods):
+    """
+    Ajusta un SARIMAX con estacionalidad inferida de la frecuencia de los datos
+    y devuelve el forecast para "periods" pasos hacia adelante.
+    Trunca el set de entrenamiento cuando el periodo estacional es grande
+    (ej. 96 para datos de 15min) para mantener el ajuste rápido.
+    """
+    m = seasonal_period_for_freq(freq)
+    max_train = m * 30 if m > 1 else 3000
+    train_s = serie.tail(max_train) if len(serie) > max_train else serie
+    seasonal_order = (1, 0, 1, m) if m > 1 else (0, 0, 0, 0)
+    fit = SARIMAX(train_s, order=(2, 1, 2), seasonal_order=seasonal_order,
+                  enforce_stationarity=False, enforce_invertibility=False).fit(disp=False)
+    forecast = fit.forecast(steps=periods)
+    return forecast
+
+
 def predict_data(model="prophet", column=None, horizon=7):
     """
     Genera predicciones de series de tiempo usando Prophet o ARIMA y grafica los valores futuros.
@@ -414,8 +453,31 @@ def predict_data(model="prophet", column=None, horizon=7):
             })
             return f"Predicción con ARIMA completada. Últimos valores:\n{forecast_df.to_string(index=False)}"
 
+        elif model.lower() == "sarima":
+            df.set_index("ds", inplace=True)
+            forecast = fit_sarima_forecast(df["y"], freq, periods)
+            future_dates = pd.date_range(df.index[-1], periods=periods + 1, freq=freq)[1:]
+
+            # Graficar
+            plt.figure(figsize=(10, 5))
+            plt.plot(df.index, df["y"], label="Datos reales")
+            plt.plot(future_dates, forecast, label="Predicción", linestyle="--")
+            plt.title(f"Predicción con SARIMA para {column} ({horizon} días)")
+            plt.xlabel("Fecha")
+            plt.ylabel(column)
+            plt.legend()
+            plt.grid(True)
+            plt.show()
+
+            # Devolver últimos valores predichos
+            forecast_df = pd.DataFrame({
+                "ds": future_dates,
+                "yhat": forecast.values
+            })
+            return f"Predicción con SARIMA completada. Últimos valores:\n{forecast_df.to_string(index=False)}"
+
         else:
-            return "Error: modelo no reconocido. Usa 'prophet' o 'arima'."
+            return "Error: modelo no reconocido. Usa 'prophet', 'arima' o 'sarima'."
 
     except Exception as e:
         return f"Error durante la predicción: {e}"
@@ -425,13 +487,13 @@ tool_predict_data = {
   'type': 'function',
   'function': {
     'name': 'predict_data',
-    'description': 'Genera predicciones de series de tiempo con Prophet o ARIMA. Siempre grafica los valores futuros junto con los datos históricos y devuelve un resumen de los últimos valores predichos.',
+    'description': 'Genera predicciones de series de tiempo con Prophet, ARIMA o SARIMA. Siempre grafica los valores futuros junto con los datos históricos y devuelve un resumen de los últimos valores predichos.',
     'parameters': {
       'type': 'object',
       'properties': {
         'model': {
           'type': 'string',
-          'description': 'Modelo de predicción a usar: "prophet" o "arima".'
+          'description': 'Modelo de predicción a usar: "prophet", "arima" o "sarima". Usa "sarima" cuando el usuario pida explícitamente SARIMA o capturar estacionalidad (ciclo diario/semanal).'
         },
         'column': {
           'type': 'string',
@@ -551,11 +613,13 @@ tool_predict_knn = {
 
 def compare_models(column=None, horizon=7, models=None, n_neighbors=5, n_lags=7):
     """
-    Compara predicciones de prophet, arima y/o knn contra datos reales retenidos (holdout)
-    y muestra un gráfico interactivo de Plotly con las métricas de error (MAE, RMSE, MAPE).
+    Compara predicciones de prophet, arima, sarima y/o knn contra datos reales retenidos
+    (holdout) y muestra un gráfico interactivo de Plotly con las métricas de error (MAE, RMSE, MAPE).
     - column: nombre de la columna a predecir y comparar
     - horizon: días retenidos como datos reales de prueba (holdout) y horizonte de predicción
-    - models: subconjunto de ["prophet","arima","knn"]. Si es None, se comparan los tres.
+    - models: subconjunto de ["prophet","arima","sarima","knn"]. Si es None, se comparan
+      prophet, arima y knn (sarima es más lento de ajustar, por lo que solo se incluye si
+      se solicita explícitamente).
     - n_neighbors, n_lags: hiperparámetros de KNN (mismos defaults que predict_knn)
     """
     try:
@@ -606,6 +670,14 @@ def compare_models(column=None, horizon=7, models=None, n_neighbors=5, n_lags=7)
             except Exception as e:
                 errors.append(f"arima: {e}")
 
+        if "sarima" in models:
+            try:
+                fcst = fit_sarima_forecast(train, freq, periods)
+                fcst.index = test_dates
+                results["sarima"] = fcst
+            except Exception as e:
+                errors.append(f"sarima: {e}")
+
         if "knn" in models:
             if len(train) <= n_lags:
                 errors.append(f"knn: no hay suficientes datos de entrenamiento ({len(train)}) para {n_lags} rezagos.")
@@ -652,8 +724,8 @@ def compare_models(column=None, horizon=7, models=None, n_neighbors=5, n_lags=7)
         fig.add_trace(go.Scatter(x=serie.index, y=serie.values, mode="lines",
                                   name="Real (histórico)", line=dict(color="#2a78d6", width=2)))
 
-        color_map = {"prophet": "#1baf7a", "arima": "#eda100", "knn": "#4a3aa7"}
-        for name in ["prophet", "arima", "knn"]:
+        color_map = {"prophet": "#1baf7a", "arima": "#eda100", "sarima": "#d6493a", "knn": "#4a3aa7"}
+        for name in ["prophet", "arima", "sarima", "knn"]:
             if name in results:
                 fig.add_trace(go.Scatter(x=test_dates, y=results[name].values, mode="lines+markers",
                                           name=f"Predicción {name}",
@@ -680,7 +752,7 @@ tool_compare_models = {
   'type': 'function',
   'function': {
     'name': 'compare_models',
-    'description': 'Compara predicciones de varios modelos (prophet, arima, knn) contra datos reales retenidos (holdout) y muestra un gráfico interactivo de Plotly con las métricas de error (MAE, RMSE, MAPE) de cada modelo. Usa esta herramienta cuando el usuario pida comparar modelos o evaluar qué tan buena es una predicción.',
+    'description': 'Compara predicciones de varios modelos (prophet, arima, sarima, knn) contra datos reales retenidos (holdout) y muestra un gráfico interactivo de Plotly con las métricas de error (MAE, RMSE, MAPE) de cada modelo. Usa esta herramienta cuando el usuario pida comparar modelos o evaluar qué tan buena es una predicción.',
     'parameters': {
       'type': 'object',
       'properties': {
@@ -695,7 +767,7 @@ tool_compare_models = {
         'models': {
           'type': 'array',
           'items': {'type': 'string'},
-          'description': 'Lista de modelos a comparar: subconjunto de ["prophet","arima","knn"]. Si no se especifica, se comparan los tres.'
+          'description': 'Lista de modelos a comparar: subconjunto de ["prophet","arima","sarima","knn"]. Si no se especifica, se comparan prophet, arima y knn (sarima es más lento de ajustar y solo se incluye si se pide explícitamente).'
         },
         'n_neighbors': {
           'type': 'integer',
@@ -798,7 +870,7 @@ def use_tool(agent_res: dict, dic_tools: dict) -> dict:
                             t_inputs.pop("models")
 
                     if "models" in t_inputs and isinstance(t_inputs["models"], list):
-                        validos = [m for m in t_inputs["models"] if m in ("prophet", "arima", "knn")]
+                        validos = [m for m in t_inputs["models"] if m in ("prophet", "arima", "sarima", "knn")]
                         if validos:
                             t_inputs["models"] = validos
                         else:
@@ -927,10 +999,11 @@ Reglas para gráficos:
 - Nunca uses matplotlib manualmente en code_exec.
 
 Reglas para predicciones:
-- Usa la herramienta predict_data para predicciones con "prophet" o "arima".
+- Usa la herramienta predict_data para predicciones con "prophet", "arima" o "sarima".
+- Usa "sarima" (dentro de predict_data) cuando el usuario pida explícitamente SARIMA o quiera capturar estacionalidad (ciclo diario/semanal) en la predicción de ARIMA.
 - Usa la herramienta predict_knn cuando el usuario pida explícitamente KNN, K-Nearest Neighbors o "vecinos más cercanos".
 - Siempre grafica los valores futuros junto con los históricos.
-- Parámetros de predict_data: {"model": "prophet" o "arima", "column": "MW", "horizon": 7}.
+- Parámetros de predict_data: {"model": "prophet", "arima" o "sarima", "column": "MW", "horizon": 7}.
 - Parámetros de predict_knn: {"column": "MW", "horizon": 7, "n_neighbors": 5, "n_lags": 7}.
 - Nunca inventes valores de predicción; deben provenir de la ejecución real.
 - Después de predecir, usa final_answer para explicar el resultado.
@@ -938,8 +1011,8 @@ Reglas para predicciones:
 Reglas para comparación de modelos:
 - Usa la herramienta compare_models cuando el usuario pida comparar modelos, evaluar qué tan buena es una predicción, o pida métricas de error (MAE, RMSE, MAPE) de una predicción.
 - compare_models NO predice hacia el futuro: retiene los últimos "horizon" días como datos reales de prueba, entrena cada modelo con el resto, y compara la predicción contra esos datos reales retenidos.
-- Parámetros: {"column": "MW", "horizon": 7, "models": ["prophet","arima","knn"]}.
-- Si el usuario no especifica modelos, compara los tres (prophet, arima, knn).
+- Parámetros: {"column": "MW", "horizon": 7, "models": ["prophet","arima","sarima","knn"]}.
+- Si el usuario no especifica modelos, compara prophet, arima y knn. Solo incluye "sarima" si el usuario lo pide explícitamente (es más lento de ajustar).
 - Siempre muestra el gráfico interactivo (Plotly) y el resumen de métricas devuelto por la herramienta.
 - Después de comparar, usa final_answer para explicar cuál modelo tuvo mejor desempeño según las métricas.
 
@@ -962,6 +1035,8 @@ Ejemplos:
 - Usuario: "Predice MW con KNN para los próximos 5 días" → {"name":"predict_knn","arguments":{"column":"MW","horizon":5}}
 - Usuario: "Compara los modelos Prophet, ARIMA y KNN para MW en los próximos 7 días" → {"name":"compare_models","arguments":{"column":"MW","horizon":7,"models":["prophet","arima","knn"]}}
 - Usuario: "¿Qué tan buena es la predicción de Prophet para MW?" → {"name":"compare_models","arguments":{"column":"MW","horizon":7,"models":["prophet"]}}
+- Usuario: "Predice MW con SARIMA para los próximos 3 días" → {"name":"predict_data","arguments":{"model":"sarima","column":"MW","horizon":3}}
+- Usuario: "Compara ARIMA contra SARIMA para MW en los próximos 5 días" → {"name":"compare_models","arguments":{"column":"MW","horizon":5,"models":["arima","sarima"]}}
 '''
 
 
