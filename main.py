@@ -3,7 +3,9 @@
 # =============================
 
 #Manejo de datos y gráficos
-import pandas as pd 
+import pandas as pd
+import matplotlib
+matplotlib.use("QtAgg")  # backend interactivo para mostrar ventanas de gráficos
 import matplotlib.pyplot as plt
 
 #Validación/limpiar, parsear JSON y salida
@@ -16,6 +18,8 @@ import json
 # Predicciones de series de tiempo
 from statsmodels.tsa.arima.model import ARIMA
 from prophet import Prophet
+from sklearn.neighbors import KNeighborsRegressor
+import numpy as np
 
 
 # Conexión con Ollama y el modeolo
@@ -415,8 +419,99 @@ tool_predict_data = {
   }
 }
 
+# =============================
+# Herramienta para predicción con KNN
+# =============================
 
 
+def predict_knn(column=None, horizon=7, n_neighbors=5, n_lags=7):
+    """
+    Genera predicciones de series de tiempo usando KNeighborsRegressor.
+    Construye features de rezago (lags) y predice paso a paso (recursivo).
+    - column: nombre de la columna a predecir
+    - horizon: horizonte de predicción en días
+    - n_neighbors: número de vecinos a usar en KNN
+    - n_lags: número de rezagos usados como features
+    """
+    try:
+        df = dtf.copy()
+        if column is None or column not in df.columns:
+            return f"Error: debes especificar una columna válida. Columnas disponibles: {list(df.columns)}"
+
+        serie = df[column].dropna()
+        if len(serie) <= n_lags:
+            return f"Error: no hay suficientes datos ({len(serie)}) para usar {n_lags} rezagos."
+
+        values = serie.values
+
+        # Construir matriz de features (lags) y target
+        X, y = [], []
+        for i in range(n_lags, len(values)):
+            X.append(values[i - n_lags:i])
+            y.append(values[i])
+        X, y = np.array(X), np.array(y)
+
+        model = KNeighborsRegressor(n_neighbors=n_neighbors)
+        model.fit(X, y)
+
+        # Predicción recursiva: usa las predicciones previas para predecir el siguiente paso
+        last_window = list(values[-n_lags:])
+        preds = []
+        for _ in range(horizon):
+            x_input = np.array(last_window[-n_lags:]).reshape(1, -1)
+            next_val = model.predict(x_input)[0]
+            preds.append(next_val)
+            last_window.append(next_val)
+
+        future_dates = pd.date_range(serie.index[-1], periods=horizon + 1, freq="D")[1:]
+        forecast_df = pd.DataFrame({"ds": future_dates, "yhat": preds})
+
+        # Graficar
+        plt.figure(figsize=(10, 5))
+        plt.plot(serie.index, serie.values, label="Datos reales")
+        plt.plot(future_dates, preds, label="Predicción KNN", linestyle="--")
+        plt.title(f"Predicción con KNN para {column} ({horizon} días)")
+        plt.xlabel("Fecha")
+        plt.ylabel(column)
+        plt.legend()
+        plt.grid(True)
+        plt.show()
+
+        return f"Predicción con KNN completada. Últimos valores:\n{forecast_df.to_string(index=False)}"
+
+    except Exception as e:
+        return f"Error durante la predicción con KNN: {e}"
+
+
+tool_predict_knn = {
+  'type': 'function',
+  'function': {
+    'name': 'predict_knn',
+    'description': 'Genera predicciones de series de tiempo usando KNeighborsRegressor (KNN) con features de rezago. Siempre grafica los valores futuros junto con los datos históricos y devuelve un resumen de los últimos valores predichos.',
+    'parameters': {
+      'type': 'object',
+      'properties': {
+        'column': {
+          'type': 'string',
+          'description': 'Nombre de la columna a predecir'
+        },
+        'horizon': {
+          'type': 'integer',
+          'description': 'Horizonte de predicción en días.'
+        },
+        'n_neighbors': {
+          'type': 'integer',
+          'description': 'Número de vecinos a usar en KNN (por defecto 5).'
+        },
+        'n_lags': {
+          'type': 'integer',
+          'description': 'Número de rezagos (valores pasados) usados como features (por defecto 7).'
+        }
+      },
+      'required': ['column']
+    }
+  }
+}
 
 
 # =============================
@@ -428,8 +523,9 @@ dic_tools = {
     "final_answer": final_answer,
     "code_exec": code_exec,
     "plot_data": plot_data,
-    "predict_data": predict_data 
-    
+    "predict_data": predict_data,
+    "predict_knn": predict_knn
+
 }
 
 # =============================
@@ -471,6 +567,15 @@ def use_tool(agent_res: dict, dic_tools: dict) -> dict:
                     # Valores por defecto
                     t_inputs.setdefault("model", "prophet")
                     t_inputs.setdefault("horizon", 7)
+                    if "column" not in t_inputs or t_inputs["column"] not in dtf.columns:
+                        t_inputs["column"] = list(dtf.columns)[0]
+
+            elif t_name == "predict_knn":
+                if isinstance(t_inputs, dict):
+                    # Valores por defecto
+                    t_inputs.setdefault("horizon", 7)
+                    t_inputs.setdefault("n_neighbors", 5)
+                    t_inputs.setdefault("n_lags", 7)
                     if "column" not in t_inputs or t_inputs["column"] not in dtf.columns:
                         t_inputs["column"] = list(dtf.columns)[0]
 
@@ -597,9 +702,11 @@ Reglas para gráficos:
 - Nunca uses matplotlib manualmente en code_exec.
 
 Reglas para predicciones:
-- Usa la herramienta predict_data para generar predicciones automáticas.
+- Usa la herramienta predict_data para predicciones con "prophet" o "arima".
+- Usa la herramienta predict_knn cuando el usuario pida explícitamente KNN, K-Nearest Neighbors o "vecinos más cercanos".
 - Siempre grafica los valores futuros junto con los históricos.
-- Parámetros: {"model": "prophet" o "arima", "column": "MW", "horizon": 7}.
+- Parámetros de predict_data: {"model": "prophet" o "arima", "column": "MW", "horizon": 7}.
+- Parámetros de predict_knn: {"column": "MW", "horizon": 7, "n_neighbors": 5, "n_lags": 7}.
 - Nunca inventes valores de predicción; deben provenir de la ejecución real.
 - Después de predecir, usa final_answer para explicar el resultado.
 
@@ -619,6 +726,7 @@ Ejemplos:
 - Usuario: "Haz un gráfico del día 2024-09-06" → {"name":"plot_data","arguments":{"columns":["MW"],"start_date":"2024-09-06","end_date":"2024-09-06","title":"MW en 2024-09-06"}}
 - Usuario: "¿Qué tan correlacionadas están MW y MW_P?" → {"name":"code_exec","arguments":{"code":"print(dtf[\"MW\"].corr(dtf[\"MW_P\"]))"}} 
 - Usuario: "Haz una predicción de los próximos 7 días con Prophet para MW" → {"name":"predict_data","arguments":{"model":"prophet","column":"MW","horizon":7}}
+- Usuario: "Predice MW con KNN para los próximos 5 días" → {"name":"predict_knn","arguments":{"column":"MW","horizon":5}}
 '''
 
 
@@ -639,7 +747,8 @@ while True:
         "final_answer": tool_final_answer,
         "code_exec": tool_code_exec,
         "plot_data": tool_plot_data,
-        "predict_data": tool_predict_data
+        "predict_data": tool_predict_data,
+        "predict_knn": tool_predict_knn
     }
     res = run_agent(llm, messages, available_tools)
     print("👽 >", res)
