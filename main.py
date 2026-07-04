@@ -15,6 +15,7 @@ import io
 import contextlib
 import re
 import json
+import time
 
 # Predicciones de series de tiempo
 from statsmodels.tsa.arima.model import ARIMA
@@ -641,15 +642,18 @@ def compare_models(column=None, horizon=7, models=None, n_neighbors=5, n_lags=7)
 
         results = {}
         errors = []
+        train_times = {}
 
         if "prophet" in models:
             try:
+                t0 = time.perf_counter()
                 train_df = train.reset_index()
                 train_df.columns = ["ds", "y"]
                 m = Prophet(daily_seasonality=True)
                 m.fit(train_df)
                 future = m.make_future_dataframe(periods=periods, freq=freq)
                 fcst = m.predict(future)
+                train_times["prophet"] = time.perf_counter() - t0
                 yhat = fcst[["ds", "yhat"]].tail(periods)["yhat"]
                 yhat.index = test_dates
                 results["prophet"] = yhat
@@ -658,12 +662,14 @@ def compare_models(column=None, horizon=7, models=None, n_neighbors=5, n_lags=7)
 
         if "arima" in models:
             try:
+                t0 = time.perf_counter()
                 train_arima = train.copy()
                 try:
                     train_arima.index.freq = pd.tseries.frequencies.to_offset(freq)
                 except ValueError:
                     pass  # índice no perfectamente regular; se deja que ARIMA infiera igual
                 fit = ARIMA(train_arima, order=(2, 1, 2)).fit()
+                train_times["arima"] = time.perf_counter() - t0
                 fcst = fit.forecast(steps=periods)
                 fcst.index = test_dates
                 results["arima"] = fcst
@@ -672,7 +678,9 @@ def compare_models(column=None, horizon=7, models=None, n_neighbors=5, n_lags=7)
 
         if "sarima" in models:
             try:
+                t0 = time.perf_counter()
                 fcst = fit_sarima_forecast(train, freq, periods)
+                train_times["sarima"] = time.perf_counter() - t0
                 fcst.index = test_dates
                 results["sarima"] = fcst
             except Exception as e:
@@ -683,6 +691,7 @@ def compare_models(column=None, horizon=7, models=None, n_neighbors=5, n_lags=7)
                 errors.append(f"knn: no hay suficientes datos de entrenamiento ({len(train)}) para {n_lags} rezagos.")
             else:
                 try:
+                    t0 = time.perf_counter()
                     values = train.values
                     X, y = [], []
                     for i in range(n_lags, len(values)):
@@ -700,6 +709,7 @@ def compare_models(column=None, horizon=7, models=None, n_neighbors=5, n_lags=7)
                         next_val = knn_model.predict(x_input)[0]
                         preds.append(next_val)
                         last_window.append(next_val)
+                    train_times["knn"] = time.perf_counter() - t0
 
                     results["knn"] = pd.Series(preds, index=test_dates)
                 except Exception as e:
@@ -716,7 +726,13 @@ def compare_models(column=None, horizon=7, models=None, n_neighbors=5, n_lags=7)
             mae = mean_absolute_error(real, pred)
             rmse = np.sqrt(mean_squared_error(real, pred))
             mape = np.mean(np.abs((real - pred) / real)) * 100
-            metric_rows.append({"Modelo": name, "MAE": round(mae, 3), "RMSE": round(rmse, 3), "MAPE (%)": round(mape, 2)})
+            metric_rows.append({
+                "Modelo": name,
+                "MAE": round(mae, 3),
+                "RMSE": round(rmse, 3),
+                "MAPE (%)": round(mape, 2),
+                "Tiempo entrenamiento (s)": round(train_times.get(name, float("nan")), 3),
+            })
         metrics_df = pd.DataFrame(metric_rows)
 
         # Graficar con Plotly
@@ -752,7 +768,7 @@ tool_compare_models = {
   'type': 'function',
   'function': {
     'name': 'compare_models',
-    'description': 'Compara predicciones de varios modelos (prophet, arima, sarima, knn) contra datos reales retenidos (holdout) y muestra un gráfico interactivo de Plotly con las métricas de error (MAE, RMSE, MAPE) de cada modelo. Usa esta herramienta cuando el usuario pida comparar modelos o evaluar qué tan buena es una predicción.',
+    'description': 'Compara predicciones de varios modelos (prophet, arima, sarima, knn) contra datos reales retenidos (holdout) y muestra un gráfico interactivo de Plotly con las métricas de error (MAE, RMSE, MAPE) y el tiempo de entrenamiento de cada modelo. Usa esta herramienta cuando el usuario pida comparar modelos o evaluar qué tan buena es una predicción.',
     'parameters': {
       'type': 'object',
       'properties': {
@@ -1013,8 +1029,8 @@ Reglas para comparación de modelos:
 - compare_models NO predice hacia el futuro: retiene los últimos "horizon" días como datos reales de prueba, entrena cada modelo con el resto, y compara la predicción contra esos datos reales retenidos.
 - Parámetros: {"column": "MW", "horizon": 7, "models": ["prophet","arima","sarima","knn"]}.
 - Si el usuario no especifica modelos, compara prophet, arima y knn. Solo incluye "sarima" si el usuario lo pide explícitamente (es más lento de ajustar).
-- Siempre muestra el gráfico interactivo (Plotly) y el resumen de métricas devuelto por la herramienta.
-- Después de comparar, usa final_answer para explicar cuál modelo tuvo mejor desempeño según las métricas.
+- Siempre muestra el gráfico interactivo (Plotly) y el resumen de métricas (incluye tiempo de entrenamiento en segundos) devuelto por la herramienta.
+- Después de comparar, usa final_answer para explicar cuál modelo tuvo mejor desempeño según las métricas y cuál fue más rápido/lento de entrenar.
 
 Reglas para final_answer:
 - Usa final_answer solo para texto descriptivo o interpretaciones.
